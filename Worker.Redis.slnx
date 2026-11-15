@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="Worker.Redis.Host/Worker.Redis.Host.csproj" />
+  <Project Path="Worker.Redis.ServiceDefaults/Worker.Redis.ServiceDefaults.csproj" />
+  <Project Path="Worker.Redis.SiloService/Worker.Redis.SiloService.csproj" />
+</Solution>
