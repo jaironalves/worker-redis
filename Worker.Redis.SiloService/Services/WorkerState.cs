@@ -24,7 +24,7 @@ public sealed class WorkerState
         }
     }
 
-    public LeadershipSession BecomeLeader(string token)
+    public LeadershipSession BecomeLeader(string token, long generation)
     {
         lock (_lock)
         {
@@ -35,7 +35,7 @@ public sealed class WorkerState
             _leadershipCts = new CancellationTokenSource();
 
             _currentSession = new LeadershipSession(
-                token,
+                token, generation,
                 _leadershipCts.Token);
 
             _nextLeadership.TrySetResult(_currentSession);

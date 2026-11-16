@@ -4,10 +4,10 @@ namespace Worker.Redis.SiloService.Services;
 
 public interface IRedisService
 {
-    // Leader
     TimeSpan LeaderRenewInterval { get; }
 
-    Task<bool> LeaderTryAcquireAsync(string token);
+    // Leader
+    Task<long?> LeaderTryAcquireAsync(string token);
 
     Task<bool> LeaderRenewAsync(string token);
 
@@ -22,22 +22,36 @@ public interface IRedisService
 
     Task<IReadOnlyList<string>> GetReadyWorkersAsync();
 
-    Task<IReadOnlyList<PartitionAssignment>> GetWorkerAssignmentsAsync(string workerId);
+    // Assets
+    Task<IReadOnlyList<string>> GetAssetsAsync();
 
-    // Catalog
+    // Partitions
     Task<IReadOnlyList<AssetPartition>> GetPartitionsAsync();
 
-    Task SavePartitionAsync(AssetPartition partition);
+    Task SavePartitionAsync(
+        AssetPartition partition,
+        LeadershipSession session);
 
-    Task RemovePartitionAsync(string partitionId);
+    Task RemovePartitionAsync(
+        string partitionId,
+        LeadershipSession session);
 
     // Assignments
     Task<IReadOnlyList<PartitionAssignment>> GetAssignmentsAsync();
 
-    Task SaveAssignmentAsync(PartitionAssignment assignment);
+    Task SaveAssignmentAsync(
+        PartitionAssignment assignment,
+        LeadershipSession session);
 
-    Task RemoveAssignmentAsync(string partitionId);    
+    Task RemoveAssignmentAsync(
+        string partitionId,
+        LeadershipSession session);
+
+    Task<IReadOnlyList<PartitionAssignment>> GetWorkerAssignmentsAsync(
+        string workerId);
 
     // Notifications
-    Task PublishAssignmentChangedAsync(string partitionId);
+    Task PublishAssignmentChangedAsync(
+        string partitionId,
+        LeadershipSession session);
 }

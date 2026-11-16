@@ -39,6 +39,7 @@ internal sealed class LeaderCoordinatorService(
                 while (!leadership.TokenCancellation.IsCancellationRequested)
                 {
                     await coordinator.ReconcileAsync(
+                        leadership,
                         leadership.TokenCancellation);
 
                     await Task.Delay(

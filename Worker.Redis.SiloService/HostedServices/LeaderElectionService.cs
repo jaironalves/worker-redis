@@ -12,23 +12,23 @@ internal sealed class LeaderElectionService(
     private static readonly TimeSpan RetryInterval =
         TimeSpan.FromSeconds(2);
 
-    private static readonly Mutex DebugLeaderMutex =
-        new(false, "AppHost2.SiloService.DebugLeader");
+    private static readonly Semaphore DebugLeaderSemaphore =
+        new(1, 1, "AppHost2.SiloService.DebugLeader");
 
     protected override async Task ExecuteAsync(
         CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
         {
-            var ownsDebugMutex = false;
+            var ownsDebugSemaphore = false;
 
             try
             {
                 if (Debugger.IsAttached)
                 {
-                    ownsDebugMutex = TryAcquireDebugMutex();
+                    ownsDebugSemaphore = TryAcquireDebugSemaphore();
 
-                    if (!ownsDebugMutex)
+                    if (!ownsDebugSemaphore)
                     {
                         await Task.Delay(
                             RetryInterval,
@@ -40,18 +40,12 @@ internal sealed class LeaderElectionService(
 
                 var token = Guid.NewGuid().ToString("N");
 
-                var acquired = await redisService.LeaderTryAcquireAsync(token);
+                var generation = await redisService.LeaderTryAcquireAsync(token);
 
-                if (!acquired)
-                {
-                    await Task.Delay(
-                        RetryInterval,
-                        stoppingToken);
+                if (generation is null)
+                    return;               
 
-                    continue;
-                }
-
-                var session = state.BecomeLeader(token);
+                var session = state.BecomeLeader(token, generation.Value);
 
                 logger.LogInformation(
                     "Worker {WorkerId} assumiu a liderança.",
@@ -96,23 +90,14 @@ internal sealed class LeaderElectionService(
             }
             finally
             {
-                if (ownsDebugMutex)
-                    DebugLeaderMutex.ReleaseMutex();
+                if (ownsDebugSemaphore)
+                    DebugLeaderSemaphore.Release();
             }
         }
     }
 
-    private static bool TryAcquireDebugMutex()
-    {
-        try
-        {
-            return DebugLeaderMutex.WaitOne(0);
-        }
-        catch (AbandonedMutexException)
-        {
-            return true;
-        }
-    }
+    private static bool TryAcquireDebugSemaphore() =>
+        DebugLeaderSemaphore.WaitOne(0);
 
     private async Task MaintainLeadershipAsync(
         string token,

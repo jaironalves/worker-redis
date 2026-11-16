@@ -1,4 +1,6 @@
-﻿namespace Worker.Redis.SiloService;
+﻿using System.Collections.Immutable;
+
+namespace Worker.Redis.SiloService;
 
 public sealed record AssetPartition
 {
@@ -19,6 +21,10 @@ public sealed record PartitionAssignment
     public required long Generation { get; init; }
 }
 
+public sealed record AssetCacheSnapshot(
+    long Version,
+    ImmutableArray<string> Assets);
+
 public sealed record ActiveSlot(
         string PartitionId,
         long PartitionVersion,
@@ -26,6 +32,7 @@ public sealed record ActiveSlot(
 
 public sealed record LeadershipSession(
     string Token,
+    long Generation,
     CancellationToken TokenCancellation);
 
 public sealed record PartitionComposition(

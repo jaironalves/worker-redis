@@ -1,10 +1,12 @@
-﻿using Worker.Redis.SiloService;
+﻿using System.Security.Cryptography;
+using System.Text;
+using Worker.Redis.SiloService;
 
 namespace Worker.Redis.SiloService.Services;
 
 internal sealed class CatalogCoordinator(
     IRedisService redisService,
-    IAssetService assetService,
+    IAssetCache assetCache,
     ILogger<CatalogCoordinator> logger)
 {
     private const int MaxAssetsPerPartition = 4;
@@ -17,29 +19,61 @@ internal sealed class CatalogCoordinator(
 
     private static long _lastGuidTimestamp = DateTime.UtcNow.Ticks;
 
+    private long? _lastAssetVersion;
+    private string? _lastCatalogSignature;
+
     public async Task ReconcileAsync(
+        LeadershipSession session,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        var assets = await assetService.GetActiveAssetsAsync();
+        var snapshot = assetCache.GetSnapshot();
+
+        var assetsChanged =
+            _lastAssetVersion != snapshot.Version;
+
+        IReadOnlyList<AssetPartition> partitions;
+
+        if (assetsChanged)
+        {
+            partitions = await ReconcilePartitionsAsync(
+                session,
+                snapshot.Assets,
+                cancellationToken);
+
+            _lastAssetVersion = snapshot.Version;
+        }
+        else
+        {
+            partitions = await redisService.GetPartitionsAsync();
+        }
 
         cancellationToken.ThrowIfCancellationRequested();
 
         var workers = await redisService.GetReadyWorkersAsync();
-
-        cancellationToken.ThrowIfCancellationRequested();
-
-        var partitions = await ReconcilePartitionsAsync(
-            assets,
-            cancellationToken);
-
-        cancellationToken.ThrowIfCancellationRequested();
-
         await ReconcileAssignmentsAsync(
+            session,
             partitions,
-            workers,
+            workers,            
             cancellationToken);
+    }
+
+    private static string CalculateCatalogSignature(
+        IReadOnlyList<string> assets)
+    {
+        var normalized = assets
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x.Trim().ToUpperInvariant())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase);
+
+        var input = $"{MaxAssetsPerPartition}|{string.Join("|", normalized)}";
+
+        var hash = SHA256.HashData(
+            Encoding.UTF8.GetBytes(input));
+
+        return Convert.ToHexString(hash);
     }
 
     // -------------------------------------------------------
@@ -65,6 +99,7 @@ internal sealed class CatalogCoordinator(
     }
 
     private async Task<IReadOnlyList<AssetPartition>> ReconcilePartitionsAsync(
+    LeadershipSession leadershipSession,
     IReadOnlyList<string> assets,
     CancellationToken cancellationToken)
     {
@@ -172,7 +207,7 @@ internal sealed class CatalogCoordinator(
             if (finalAssets.Count == 0)
             {
                 await redisService.RemovePartitionAsync(
-                    composition.Original.Id);
+                    composition.Original.Id, leadershipSession);
 
                 logger.LogInformation(
                     "Slot {PartitionId} removido após compactação.",
@@ -195,7 +230,7 @@ internal sealed class CatalogCoordinator(
 
             if (changed)
             {
-                await redisService.SavePartitionAsync(partition);
+                await redisService.SavePartitionAsync(partition, leadershipSession);
 
                 logger.LogInformation(
                     "Slot {PartitionId} atualizado. Ativos: {Count}. Versão: {Version}.",
@@ -227,7 +262,7 @@ internal sealed class CatalogCoordinator(
                 Assets = newAssets
             };
 
-            await redisService.SavePartitionAsync(partition);
+            await redisService.SavePartitionAsync(partition, leadershipSession);
 
             result.Add(partition);
 
@@ -245,6 +280,7 @@ internal sealed class CatalogCoordinator(
     // -------------------------------------------------------
 
     private async Task ReconcileAssignmentsAsync(
+        LeadershipSession session,
         IReadOnlyList<AssetPartition> partitions,
         IReadOnlyList<string> workers,
         CancellationToken cancellationToken)
@@ -266,7 +302,7 @@ internal sealed class CatalogCoordinator(
             if (!partitionIds.Contains(assignment.PartitionId))
             {
                 await redisService.RemoveAssignmentAsync(
-                    assignment.PartitionId);
+                    assignment.PartitionId, session);
             }
         }
 
@@ -454,10 +490,10 @@ internal sealed class CatalogCoordinator(
                 PartitionVersion = partition.Version
             };
 
-            await redisService.SaveAssignmentAsync(assignment);
+            await redisService.SaveAssignmentAsync(assignment, session);
 
             await redisService.PublishAssignmentChangedAsync(
-                assignment.PartitionId);
+                assignment.PartitionId, session);
 
             finalAssignments[partition.Id] = assignment;
 

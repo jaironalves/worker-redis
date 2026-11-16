@@ -3,6 +3,7 @@ using Orleans.Configuration;
 using Orleans.Dashboard;
 using StackExchange.Redis;
 using Worker.Redis.SiloService.HostedServices;
+using Worker.Redis.SiloService.Redis;
 using Worker.Redis.SiloService.Services;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -41,13 +42,21 @@ builder.UseOrleans(siloBuilder =>
 
 builder.Services.AddSingleton<WorkerState>();
 
+builder.Services.Configure<RedisServiceOptions>(options =>
+{
+    options.LeaderLeaseDuration = TimeSpan.FromSeconds(15);
+    options.LeaderRenewInterval = TimeSpan.FromSeconds(5);
+    options.WorkerHeartbeatTtl = TimeSpan.FromSeconds(15);
+});
+
 builder.Services.AddSingleton<IRedisService, RedisService>();
 
 builder.Services.AddSingleton<CatalogCoordinator>();
 
-builder.Services.AddSingleton<IAssetService, JsonAssetService>();
+builder.Services.AddSingleton<IAssetCache, AssetCache>();
 builder.Services.AddSingleton<ISseOrchestrator, SseOrchestrator>();
 
+builder.Services.AddHostedService<AssetRefreshService>();
 builder.Services.AddHostedService<MembershipService>();
 builder.Services.AddHostedService<LeaderElectionService>();
 builder.Services.AddHostedService<LeaderCoordinatorService>();

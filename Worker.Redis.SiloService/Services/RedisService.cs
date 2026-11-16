@@ -1,62 +1,82 @@
-﻿using StackExchange.Redis;
+﻿using Microsoft.Extensions.Options;
+using StackExchange.Redis;
+using System.Globalization;
 using System.Text.Json;
+using Worker.Redis.SiloService.Redis;
 
 namespace Worker.Redis.SiloService.Services;
 
-internal sealed class RedisService(
-    IConnectionMultiplexer multiplexer) : IRedisService
+public sealed class RedisService(
+    IConnectionMultiplexer multiplexer,
+    IOptions<RedisServiceOptions> options,
+    ILogger<RedisService> logger) : IRedisService
 {
-    private readonly IDatabase _redisDb = multiplexer.GetDatabase();
-    private readonly ISubscriber _subscriber = multiplexer.GetSubscriber();
-
-    private const string LeaderKey = "md:leader";
-
-    private const string WorkerKeyPrefix = "md:worker:";
-    private const string WorkersAliveKey = "md:workers:alive";
-    private const string WorkersReadyKey = "md:workers:ready";
-
-    private const string CatalogKey = "md:catalog:partitions";
-    private const string AssignmentsKey = "md:assignments";
-
-    private const string AssignmentChannel = "md:assignment:changed";
-
-    private static readonly TimeSpan LeaderLeaseTime =
-        TimeSpan.FromSeconds(15);
-
-    private static readonly TimeSpan WorkerTtl =
-        TimeSpan.FromSeconds(15);
-
-    private static readonly JsonSerializerOptions JsonOptions =
-        new(JsonSerializerDefaults.Web);
+    private readonly IDatabase _database = multiplexer.GetDatabase();
+    private readonly RedisServiceOptions _options = options.Value;
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
 
     public TimeSpan LeaderRenewInterval =>
-        TimeSpan.FromSeconds(5);
+        _options.LeaderRenewInterval;
 
     // =========================================================
     // LEADER
     // =========================================================
 
-    public Task<bool> LeaderTryAcquireAsync(string token)
+    public async Task<long?> LeaderTryAcquireAsync(string token)
     {
-        return _redisDb.LockTakeAsync(
-            LeaderKey,
-            token,
-            LeaderLeaseTime);
+        var result = await _database.ScriptEvaluateAsync(
+            RedisScripts.AcquireLeaderScript,
+            [
+                RedisKeys.Leader,
+                RedisKeys.LeaderGeneration
+            ],
+            [
+                token,
+                (long)_options.LeaderLeaseDuration.TotalMilliseconds
+            ]);
+
+        var generation = (long)result;
+
+        if (generation == 0)
+            return null;
+
+        logger.LogInformation(
+            "Liderança adquirida. Generation: {Generation}",
+            generation);
+
+        return generation;
     }
 
-    public Task<bool> LeaderRenewAsync(string token)
+    public async Task<bool> LeaderRenewAsync(string token)
     {
-        return _redisDb.LockExtendAsync(
-            LeaderKey,
-            token,
-            LeaderLeaseTime);
+        var result = await _database.ScriptEvaluateAsync(
+            RedisScripts.RenewLeaderScript,
+            [
+                RedisKeys.Leader
+            ],
+            [
+                token,
+                (long)_options.LeaderLeaseDuration.TotalMilliseconds
+            ]);
+
+        return (long)result == 1;
     }
 
-    public Task<bool> LeaderReleaseAsync(string token)
+    public async Task<bool> LeaderReleaseAsync(string token)
     {
-        return _redisDb.LockReleaseAsync(
-            LeaderKey,
-            token);
+        var result = await _database.ScriptEvaluateAsync(
+            RedisScripts.ReleaseLeaderScript,
+            [
+                RedisKeys.Leader
+            ],
+            [
+                token
+            ]);
+
+        return (long)result == 1;
     }
 
     // =========================================================
@@ -65,134 +85,204 @@ internal sealed class RedisService(
 
     public async Task RegisterWorkerAsync(string workerId)
     {
-        var batch = _redisDb.CreateBatch();
+        var workerKey = RedisKeys.Worker(workerId);
 
-        var workerTask = batch.StringSetAsync(
-            $"{WorkerKeyPrefix}{workerId}",
-            "alive",
-            WorkerTtl);
+        await _database.StringSetAsync(
+            workerKey,
+            workerId,
+            _options.WorkerHeartbeatTtl);
 
-        var setTask = batch.SetAddAsync(
-            WorkersAliveKey,
-            workerId);
-
-        batch.Execute();
-
-        await Task.WhenAll(workerTask, setTask);
-    }
-
-    public Task SetWorkerReadyAsync(string workerId)
-    {
-        return _redisDb.SetAddAsync(
-            WorkersReadyKey,
+        await _database.SetAddAsync(
+            RedisKeys.AliveWorkers,
             workerId);
     }
 
-    public Task<IReadOnlyList<string>> GetAliveWorkersAsync()
+    public async Task SetWorkerReadyAsync(string workerId)
     {
-        return GetWorkersFromSetAsync(
-            WorkersAliveKey,
-            removeFromReadySet: false);
+        var workerKey = RedisKeys.Worker(workerId);
+
+        var exists = await _database.KeyExistsAsync(workerKey);
+
+        if (!exists)
+        {
+            throw new InvalidOperationException(
+                $"Worker {workerId} não possui heartbeat ativo.");
+        }
+
+        await _database.SetAddAsync(
+            RedisKeys.ReadyWorkers,
+            workerId);
+
+        logger.LogInformation(
+            "Worker {WorkerId} está pronto.",
+            workerId);
     }
 
-    public Task<IReadOnlyList<string>> GetReadyWorkersAsync()
+    public async Task<IReadOnlyList<string>> GetAliveWorkersAsync()
     {
-        return GetWorkersFromSetAsync(
-            WorkersReadyKey,
-            removeFromReadySet: true);
+        var workers = await _database.SetMembersAsync(
+            RedisKeys.AliveWorkers);
+
+        var alive = new List<string>();
+
+        foreach (var worker in workers)
+        {
+            var workerId = worker.ToString();
+
+            if (await _database.KeyExistsAsync(
+                    RedisKeys.Worker(workerId)))
+            {
+                alive.Add(workerId);
+            }
+            else
+            {
+                await RemoveDeadWorkerAsync(workerId);
+            }
+        }
+
+        return alive;
     }
 
-    public async Task<IReadOnlyList<PartitionAssignment>>    GetWorkerAssignmentsAsync(string workerId)
+    public async Task<IReadOnlyList<string>> GetReadyWorkersAsync()
     {
-        var assignments = await GetAssignmentsAsync();
-
-        return assignments
-            .Where(x => x.WorkerId == workerId)
-            .ToList();
-    }
-
-    private async Task<IReadOnlyList<string>> GetWorkersFromSetAsync(
-        string setKey,
-        bool removeFromReadySet)
-    {
-        var workers = await _redisDb.SetMembersAsync(setKey);
+        var workers = await _database.SetMembersAsync(
+            RedisKeys.ReadyWorkers);
 
         if (workers.Length == 0)
             return [];
 
-        var batch = _redisDb.CreateBatch();
-
-        var tasks = workers
-            .Select(worker =>
-                batch.KeyExistsAsync(
-                    $"{WorkerKeyPrefix}{worker}"))
-            .ToArray();
-
-        batch.Execute();
-
-        var exists = await Task.WhenAll(tasks);
-
-        var result = new List<string>();
-
-        for (var i = 0; i < workers.Length; i++)
+        var checks = workers.Select(async worker =>
         {
-            var workerId = workers[i].ToString();
+            var workerId = worker.ToString();
 
-            if (exists[i])
+            var exists = await _database.KeyExistsAsync(
+                RedisKeys.Worker(workerId));
+
+            return (WorkerId: workerId, Alive: exists);
+        });
+
+        var results = await Task.WhenAll(checks);
+
+        var alive = new List<string>();
+
+        foreach (var result in results)
+        {
+            if (result.Alive)
             {
-                result.Add(workerId);
-                continue;
+                alive.Add(result.WorkerId);
             }
-
-            await _redisDb.SetRemoveAsync(
-                setKey,
-                workers[i]);
-
-            if (removeFromReadySet)
+            else
             {
-                await _redisDb.SetRemoveAsync(
-                    WorkersAliveKey,
-                    workers[i]);
+                await RemoveDeadWorkerAsync(result.WorkerId);
             }
         }
 
-        return result;
+        return alive;
+    }
+
+    private async Task RemoveDeadWorkerAsync(string workerId)
+    {
+        await _database.SetRemoveAsync(
+            RedisKeys.AliveWorkers,
+            workerId);
+
+        await _database.SetRemoveAsync(
+            RedisKeys.ReadyWorkers,
+            workerId);
+
+        logger.LogInformation(
+            "Worker {WorkerId} removido por ausência de heartbeat.",
+            workerId);
     }
 
     // =========================================================
-    // CATALOG
+    // ASSETS
+    // =========================================================
+
+    public async Task<IReadOnlyList<string>> GetAssetsAsync()
+    {
+        var assets = await _database.SetMembersAsync(
+            RedisKeys.Assets);
+
+        return assets
+            .Select(x => x.ToString())
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToArray();
+    }
+
+    // =========================================================
+    // PARTITIONS
     // =========================================================
 
     public async Task<IReadOnlyList<AssetPartition>> GetPartitionsAsync()
     {
-        var entries = await _redisDb.HashGetAllAsync(CatalogKey);
+        var entries = await _database.HashGetAllAsync(
+            RedisKeys.Catalog);
 
-        return [.. entries
-            .Where(x => x.Value.HasValue)
-            .Select(x =>
-                JsonSerializer.Deserialize<AssetPartition>(
-                    x.Value.ToString(),
-                    JsonOptions))
-            .Where(x => x is not null)
-            .Cast<AssetPartition>()];
+        var partitions = new List<AssetPartition>(entries.Length);
+
+        foreach (var entry in entries)
+        {
+            var partition = JsonSerializer.Deserialize<AssetPartition>(
+                entry.Value.ToString(),
+                JsonOptions);
+
+            if (partition is not null)
+                partitions.Add(partition);
+        }
+
+        return partitions;
     }
 
-    public Task SavePartitionAsync(AssetPartition partition)
+    public async Task SavePartitionAsync(
+        AssetPartition partition,
+        LeadershipSession session)
     {
-        var json = JsonSerializer.Serialize(
-            partition,
-            JsonOptions);
+        var json = JsonSerializer.Serialize(partition, JsonOptions);
 
-        return _redisDb.HashSetAsync(
-            CatalogKey,
+        var result = await _database.ScriptEvaluateAsync(
+            RedisScripts.SavePartitionScript,
+            [
+                RedisKeys.Leader,
+                RedisKeys.LeaderGeneration,
+                RedisKeys.Catalog
+            ],
+            [
+                session.Token,
+                GenerationValue(session),
+                partition.Id,
+                json
+            ]);
+
+        EnsureLeadership(result, session);
+
+        logger.LogDebug(
+            "Partição {PartitionId} salva. Version: {Version}",
             partition.Id,
-            json);
+            partition.Version);
     }
 
-    public Task RemovePartitionAsync(string partitionId)
+    public async Task RemovePartitionAsync(
+        string partitionId,
+        LeadershipSession session)
     {
-        return _redisDb.HashDeleteAsync(
-            CatalogKey,
+        var result = await _database.ScriptEvaluateAsync(
+            RedisScripts.RemovePartitionScript,
+            [
+                RedisKeys.Leader,
+                RedisKeys.LeaderGeneration,
+                RedisKeys.Catalog
+            ],
+            [
+                session.Token,
+                GenerationValue(session),
+                partitionId
+            ]);
+
+        EnsureLeadership(result, session);
+
+        logger.LogDebug(
+            "Partição {PartitionId} removida.",
             partitionId);
     }
 
@@ -202,48 +292,146 @@ internal sealed class RedisService(
 
     public async Task<IReadOnlyList<PartitionAssignment>> GetAssignmentsAsync()
     {
-        var entries = await _redisDb.HashGetAllAsync(
-            AssignmentsKey);
+        var entries = await _database.HashGetAllAsync(
+            RedisKeys.Assignments);
 
-        return entries
-            .Where(x => x.Value.HasValue)
-            .Select(x =>
+        var assignments = new List<PartitionAssignment>(
+            entries.Length);
+
+        foreach (var entry in entries)
+        {
+            var assignment =
                 JsonSerializer.Deserialize<PartitionAssignment>(
-                    x.Value.ToString(),
-                    JsonOptions))
-            .Where(x => x is not null)
-            .Cast<PartitionAssignment>()
-            .ToArray();
+                    entry.Value.ToString(),
+                    JsonOptions);
+
+            if (assignment is not null)
+                assignments.Add(assignment);
+        }
+
+        return assignments;
     }
 
-    public Task SaveAssignmentAsync(
-        PartitionAssignment assignment)
+    public async Task SaveAssignmentAsync(
+        PartitionAssignment assignment,
+        LeadershipSession session)
     {
         var json = JsonSerializer.Serialize(
             assignment,
             JsonOptions);
 
-        return _redisDb.HashSetAsync(
-            AssignmentsKey,
+        var result = await _database.ScriptEvaluateAsync(
+            RedisScripts.SaveAssignmentScript,
+            [
+                RedisKeys.Leader,
+                RedisKeys.LeaderGeneration,
+                RedisKeys.Assignments
+            ],
+            [
+                session.Token,
+                GenerationValue(session),
+                assignment.PartitionId,
+                json
+            ]);
+
+        EnsureLeadership(result, session);
+
+        logger.LogDebug(
+            "Assignment da partição {PartitionId} salvo para worker {WorkerId}.",
             assignment.PartitionId,
-            json);
+            assignment.WorkerId);
     }
 
-    public Task RemoveAssignmentAsync(string partitionId)
+    public async Task RemoveAssignmentAsync(
+        string partitionId,
+        LeadershipSession session)
     {
-        return _redisDb.HashDeleteAsync(
-            AssignmentsKey,
+        var result = await _database.ScriptEvaluateAsync(
+            RedisScripts.RemoveAssignmentScript,
+            [
+                RedisKeys.Leader,
+                RedisKeys.LeaderGeneration,
+                RedisKeys.Assignments
+            ],
+            [
+                session.Token,
+                GenerationValue(session),
+                partitionId
+            ]);
+
+        EnsureLeadership(result, session);
+
+        logger.LogDebug(
+            "Assignment da partição {PartitionId} removido.",
             partitionId);
     }
 
+    public async Task<IReadOnlyList<PartitionAssignment>>
+        GetWorkerAssignmentsAsync(string workerId)
+    {
+        var assignments = await GetAssignmentsAsync();
+
+        return assignments
+            .Where(x => string.Equals(
+                x.WorkerId,
+                workerId,
+                StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+    }
+
     // =========================================================
-    // NOTIFICATIONS
+    // PUB/SUB
     // =========================================================
 
-    public Task PublishAssignmentChangedAsync(string partitionId)
+    public async Task PublishAssignmentChangedAsync(
+        string partitionId,
+        LeadershipSession session)
     {
-        return _subscriber.PublishAsync(
-            AssignmentChannel,
-            partitionId);
+        var result = await _database.ScriptEvaluateAsync(
+            RedisScripts.PublishAssignmentScript,
+            [
+                RedisKeys.Leader,
+                RedisKeys.LeaderGeneration
+            ],
+            [
+                session.Token,
+                GenerationValue(session),
+                RedisKeys.AssignmentChannel,
+                partitionId
+            ]);
+
+        EnsureLeadership(result, session);
+    }
+
+    // =========================================================
+    // HELPERS
+    // =========================================================
+
+    private static RedisValue GenerationValue(
+        LeadershipSession session)
+    {
+        return session.Generation.ToString(
+            CultureInfo.InvariantCulture);
+    }
+
+    private static void EnsureLeadership(
+        RedisResult result,
+        LeadershipSession session)
+    {
+        var value = (long)result;
+
+        if (value == -1)
+        {
+            throw new LeadershipLostException(
+                $"Gravação rejeitada. " +
+                $"Token ou Generation inválido. " +
+                $"Generation da sessão: {session.Generation}.");
+        }
+
+        if (value != 1 && value < 0)
+        {
+            throw new InvalidOperationException(
+                $"Resultado inesperado do Redis: {value}.");
+        }
     }
 }
