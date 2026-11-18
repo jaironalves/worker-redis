@@ -30,6 +30,24 @@ internal static class RedisScripts
         return redis.call('INCR', KEYS[2])
         """;
 
+    private const string ValidateLeadership = """
+        local current = redis.call('GET', KEYS[1])
+
+        if not current then
+            return -1
+        end
+
+        local leader = cjson.decode(current)
+
+        if leader.token ~= ARGV[1] then
+            return -1
+        end
+
+        if redis.call('GET', KEYS[2]) ~= ARGV[2] then
+            return -1
+        end
+        """;
+
     public const string RenewLeaderScript = """
         local current = redis.call('GET', KEYS[1])
 
@@ -54,61 +72,37 @@ internal static class RedisScripts
     return redis.call('DEL', KEYS[1])
     """;
 
-    public const string SavePartitionScript = """
-    if redis.call('GET', KEYS[1]) ~= ARGV[1] then
-        return -1
-    end
+    public const string SavePartitionScript = $$"""
+        {{ValidateLeadership}}
 
-    if redis.call('GET', KEYS[2]) ~= ARGV[2] then
-        return -1
-    end
+        redis.call('HSET', KEYS[3], ARGV[3], ARGV[4])
 
-    redis.call('HSET', KEYS[3], ARGV[3], ARGV[4])
+        return 1
+        """;
 
-    return 1
-    """;
+    public const string RemovePartitionScript = $$"""
+        {{ValidateLeadership}}
 
-    public const string RemovePartitionScript = """
-    if redis.call('GET', KEYS[1]) ~= ARGV[1] then
-        return -1
-    end
+        redis.call('HDEL', KEYS[3], ARGV[3])
 
-    if redis.call('GET', KEYS[2]) ~= ARGV[2] then
-        return -1
-    end
+        return 1
+        """;
 
-    redis.call('HDEL', KEYS[3], ARGV[3])
+    public const string SaveAssignmentScript = $$"""
+        {{ValidateLeadership}}
 
-    return 1
-    """;
+        redis.call('HSET', KEYS[3], ARGV[3], ARGV[4])
 
-    public const string SaveAssignmentScript = """
-    if redis.call('GET', KEYS[1]) ~= ARGV[1] then
-        return -1
-    end
+        return 1
+        """;
 
-    if redis.call('GET', KEYS[2]) ~= ARGV[2] then
-        return -1
-    end
+    public const string RemoveAssignmentScript = $$"""
+        {{ValidateLeadership}}
 
-    redis.call('HSET', KEYS[3], ARGV[3], ARGV[4])
+        redis.call('HDEL', KEYS[3], ARGV[3])
 
-    return 1
-    """;
-
-    public const string RemoveAssignmentScript = """
-    if redis.call('GET', KEYS[1]) ~= ARGV[1] then
-        return -1
-    end
-
-    if redis.call('GET', KEYS[2]) ~= ARGV[2] then
-        return -1
-    end
-
-    redis.call('HDEL', KEYS[3], ARGV[3])
-
-    return 1
-    """;
+        return 1
+        """;
 
     public const string PublishAssignmentScript = """
     if redis.call('GET', KEYS[1]) ~= ARGV[1] then

@@ -389,6 +389,8 @@ public sealed class RedisService(
         string partitionId,
         LeadershipSession session)
     {
+        return Task.CompletedTask;
+
         var result = await _database.ScriptEvaluateAsync(
             RedisScripts.PublishAssignmentScript,
             [

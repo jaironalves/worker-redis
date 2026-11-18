@@ -24,19 +24,19 @@ internal sealed class LeaderElectionService(
 
             try
             {
-                if (Debugger.IsAttached)
-                {
-                    ownsDebugSemaphore = TryAcquireDebugSemaphore();
+                //if (Debugger.IsAttached)
+                //{
+                //    ownsDebugSemaphore = TryAcquireDebugSemaphore();
 
-                    if (!ownsDebugSemaphore)
-                    {
-                        await Task.Delay(
-                            RetryInterval,
-                            stoppingToken);
+                //    if (!ownsDebugSemaphore)
+                //    {
+                //        await Task.Delay(
+                //            RetryInterval,
+                //            stoppingToken);
 
-                        continue;
-                    }
-                }
+                //        continue;
+                //    }
+                //}
 
                 var token = Guid.NewGuid().ToString("N");
 
