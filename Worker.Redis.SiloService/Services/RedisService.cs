@@ -25,7 +25,8 @@ public sealed class RedisService(
     // LEADER
     // =========================================================
 
-    public async Task<long?> LeaderTryAcquireAsync(string token)
+    public async Task<long?> LeaderTryAcquireAsync(string token,
+        int revision)
     {
         var result = await _database.ScriptEvaluateAsync(
             RedisScripts.AcquireLeaderScript,
@@ -35,6 +36,7 @@ public sealed class RedisService(
             ],
             [
                 token,
+                revision,
                 (long)_options.LeaderLeaseDuration.TotalMilliseconds
             ]);
 

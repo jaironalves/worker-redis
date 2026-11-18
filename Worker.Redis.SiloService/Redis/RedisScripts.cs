@@ -7,22 +7,44 @@ namespace Worker.Redis.SiloService.Redis;
 internal static class RedisScripts
 {
     public const string AcquireLeaderScript = """
-    if redis.call('EXISTS', KEYS[1]) == 1 then
-        return 0
-    end
+        local current = redis.call('GET', KEYS[1])
 
-    redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+        if current then
+            local leader = cjson.decode(current)
 
-    return redis.call('INCR', KEYS[2])
-    """;
+            local currentRevision = tonumber(leader.revision)
+            local candidateRevision = tonumber(ARGV[2])
+
+            if candidateRevision <= currentRevision then
+                return 0
+            end
+        end
+
+        local newLeader = cjson.encode({
+            revision = tonumber(ARGV[2]),
+            token = ARGV[1]
+        })
+
+        redis.call('SET', KEYS[1], newLeader, 'PX', ARGV[3])
+
+        return redis.call('INCR', KEYS[2])
+        """;
 
     public const string RenewLeaderScript = """
-    if redis.call('GET', KEYS[1]) ~= ARGV[1] then
-        return 0
-    end
+        local current = redis.call('GET', KEYS[1])
 
-    return redis.call('PEXPIRE', KEYS[1], ARGV[2])
-    """;
+        if not current then
+            return 0
+        end
+
+        local leader = cjson.decode(current)
+
+        if leader.token ~= ARGV[1] then
+            return 0
+        end
+
+        return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+        """;
 
     public const string ReleaseLeaderScript = """
     if redis.call('GET', KEYS[1]) ~= ARGV[1] then

@@ -40,7 +40,7 @@ internal sealed class LeaderElectionService(
 
                 var token = Guid.NewGuid().ToString("N");
 
-                var generation = await redisService.LeaderTryAcquireAsync(token);
+                var generation = await redisService.LeaderTryAcquireAsync(token, 1);
 
                 if (generation is null)
                     return;               
@@ -122,7 +122,7 @@ internal sealed class LeaderElectionService(
                     RetryInterval,
                     stoppingToken);
 
-                await redisService.LeaderTryAcquireAsync(token);
+                await redisService.LeaderTryAcquireAsync(token, 1);
             }
         }
     }

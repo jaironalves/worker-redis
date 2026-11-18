@@ -7,7 +7,7 @@ public interface IRedisService
     TimeSpan LeaderRenewInterval { get; }
 
     // Leader
-    Task<long?> LeaderTryAcquireAsync(string token);
+    Task<long?> LeaderTryAcquireAsync(string token, int revision);
 
     Task<bool> LeaderRenewAsync(string token);
 
